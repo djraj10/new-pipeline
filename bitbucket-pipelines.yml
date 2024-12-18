@@ -1,0 +1,89 @@
+image: node:18.18.0
+
+definitions:
+  steps:
+    - step: &build-docker-image
+        name: Build docker image
+        image: python:3.11.7
+        services:
+          - docker
+        caches:
+          - pip
+        script:
+          - bash kube/script/common/build-docker-image.sh
+    - step: &scan-files
+        name: Scan files
+        image: aquasec/trivy:0.49.1
+        script:
+          - trivy --severity=HIGH,CRITICAL --exit-code=1 fs .
+    - step: &scan-image
+        name: Scan image
+        services:
+          - docker
+        image: aquasec/trivy:0.49.1
+        script:
+          - apk --no-cache add bash=5.2.21-r0
+          - bash kube/script/common/scan-image.sh
+    - step: &sonar-scan
+        name: Code quality with Sonar Qube
+        clone:
+          depth: full
+        script:
+          - pipe: sonarsource/sonarcloud-scan:1.2.0
+            variables:
+              EXTRA_ARGS: |
+                -Dsonar.organization=${SONAR_ORG}
+                -Dsonar.projectKey=${SONAR_PROJECT_KEY}
+                -Dsonar.sources=./src
+                -Dsonar.host.url=${SONAR_URL}
+    - step: &build-kube-configs
+        name: Build kubernetes configs
+        image: alpine/helm:3.11.1
+        artifacts:
+          paths:
+            - 'kube/script/configs.yaml'
+        script:
+          - bash kube/script/common/build-kube-configs.sh
+    - step: &rollout
+        name: Rollout
+        image: 'kroniak/ssh-client:3.18'
+        script:
+          - bash kube/script/common/before-ssh.sh
+          - bash kube/script/rollout.sh
+    - step: &sentry-build-source-map
+        name: Build source map for Sentry
+        script:
+          - git submodule update --init && npm install && npm run build-with-sentry
+
+pipelines:
+  branches:
+    main:
+      - stage:
+          name: 'Deploy DEV environment'
+          deployment: Development
+          steps:
+            - step: *build-docker-image
+            - step: *sentry-build-source-map
+            - step: *build-kube-configs
+            - step: *rollout
+  tags:
+    'v-*-uat':
+      - stage:
+          name: 'Deploy UAT environment'
+          deployment: 'User Acceptance Test'
+          steps:
+            # - step: *scan-files
+            # - step: *sonar-scan
+            - step: *build-docker-image
+            # - step: *scan-image
+            - step: *sentry-build-source-map
+            - step: *build-kube-configs
+            - step: *rollout
+    'v-*-prod':
+      - stage:
+          name: 'Deploy PROD environment'
+          deployment: 'Production'
+          steps:
+            - step: *sentry-build-source-map
+            - step: *build-kube-configs
+            - step: *rollout
